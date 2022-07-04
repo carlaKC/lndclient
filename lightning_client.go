@@ -201,6 +201,12 @@ type LightningClient interface {
 
 	// SendCustomMessage sends a custom message to a per.
 	SendCustomMessage(ctx context.Context, msg CustomMessage) error
+
+	// SubscribeCustomMessages creates a subscription to custom messages
+	// received from our peers.
+	SubscribeCustomMessages(ctx context.Context,
+		opts ...CustomFilterOption) (chan<- CustomMessage, chan<- error,
+		error)
 }
 
 // Info contains info about the connected lnd node.
@@ -1089,6 +1095,75 @@ type CustomMessage struct {
 
 	// Data is the data exchanged.
 	Data []byte
+}
+
+// CustomMessageFilter provides a filter for subscribing to custom messages.
+type CustomMessageFilter struct {
+	// PeerFilter contains a set of peers that we want to receive messages
+	// from. If this map is nil, we will receive from all peers.
+	PeerFilter map[route.Vertex]bool
+
+	// TypeFilter contains a set of protocol message numbers that we want
+	// to receive in a subscription. If this map is nil, we will receive all
+	// message types.
+	TypeFilter map[uint32]bool
+}
+
+// SendMessage checks a message against our peer and type filters, returning a
+// boolean indicating whether it should be sent to a subscriber.
+func (c *CustomMessageFilter) SendMessage(msg CustomMessage) bool {
+	include := true
+
+	// If we have a peer filter set, only return messages if their peer is
+	// in our map.
+	if c.PeerFilter != nil {
+		_, peerFilter := c.PeerFilter[msg.Peer]
+		include = include && peerFilter
+	}
+
+	// If we have a type filter set, only return messages if their type is
+	// in our filter map.
+	if c.TypeFilter != nil {
+		_, typeFilter := c.TypeFilter[msg.MsgType]
+		include = include && typeFilter
+	}
+
+	return true
+}
+
+// CustomFilterOption is a functional option signature used to set filters for
+// custom message subscriptions.
+type CustomFilterOption func(*CustomMessageFilter)
+
+// CustomFilterPeers returns a functional option to filter for a specific set of
+// peers in custom message subscription.
+func CustomFilterPeers(peers []route.Vertex) CustomFilterOption {
+	return func(f *CustomMessageFilter) {
+		if len(peers) == 0 {
+			return
+		}
+
+		f.PeerFilter = make(map[route.Vertex]bool, len(peers))
+
+		for _, peer := range peers {
+			f.PeerFilter[peer] = true
+		}
+	}
+}
+
+// CustomFilterMessages returns a funcional option to filter for a specific set
+// of protocol message types in custom message subscriptions.
+func CustomFilterMessages(messages []uint32) CustomFilterOption {
+	return func(f *CustomMessageFilter) {
+		if len(messages) == 0 {
+			return
+		}
+
+		f.TypeFilter = make(map[uint32]bool)
+		for _, msgType := range messages {
+			f.TypeFilter[msgType] = true
+		}
+	}
 }
 
 var (
@@ -3756,4 +3831,85 @@ func (s *lightningClient) SendCustomMessage(ctx context.Context,
 
 	_, err := s.client.SendCustomMessage(rpcCtx, rpcReq)
 	return err
+}
+
+// SubscribeCustomMessages subscribes to a stream of custom messages, optionally
+// filtering by peer and message type.
+func (s *lightningClient) SubscribeCustomMessages(ctx context.Context,
+	opts ...CustomFilterOption) (chan<- CustomMessage, chan<- error,
+	error) {
+
+	// Start with an empty filter and apply functional options provided.
+	filter := &CustomMessageFilter{}
+	for _, opt := range opts {
+		opt(filter)
+	}
+
+	rpcCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	rpcCtx = s.adminMac.WithMacaroonAuth(rpcCtx)
+	rpcReq := &lnrpc.SubscribeCustomMessagesRequest{}
+
+	client, err := s.client.SubscribeCustomMessages(rpcCtx, rpcReq)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		// Buffer error channel by 1 so that consumer reading from this
+		// channel does not block our exit.
+		errChan = make(chan error, 1)
+		msgChan = make(chan CustomMessage)
+	)
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		for {
+			// Before we try to receive, do a quick sanity check
+			// that our context wasn't canceled by the caller. This
+			// allows us to exist faster than waiting for Recv() to
+			// exit.
+			if ctx.Err() != nil {
+				errChan <- ctx.Err()
+				return
+			}
+
+			msg, err := client.Recv()
+			if err != nil {
+				errChan <- fmt.Errorf("receive failed: %w", err)
+				return
+			}
+
+			peer, err := route.NewVertexFromBytes(msg.Peer)
+			if err != nil {
+				errChan <- fmt.Errorf("invalid peer: %w", err)
+				return
+			}
+
+			customMsg := CustomMessage{
+				Peer:    peer,
+				Data:    msg.Data,
+				MsgType: msg.Type,
+			}
+
+			// Skip over messages that our caller filtered out.
+			if !filter.SendMessage(customMsg) {
+				log.Debugf("Skipping message: %v / %v",
+					customMsg.Peer, customMsg.MsgType)
+
+				continue
+			}
+
+			select {
+			case msgChan <- customMsg:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return msgChan, errChan, nil
 }
