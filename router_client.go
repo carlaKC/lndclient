@@ -73,6 +73,10 @@ type RouterClient interface {
 	// (enabled, disabled, or auto).
 	UpdateChanStatus(ctx context.Context,
 		channel *wire.OutPoint, action routerrpc.ChanStatusAction) error
+
+	// SendToRouteV2 sends a payment to the route requested.
+	SendToRouteV2(ctx context.Context,
+		req SendToRouteRequest) (<-chan PaymentStatus, <-chan error)
 }
 
 // PaymentStatus describe the state of a payment.
@@ -1043,4 +1047,75 @@ func (r *routerClient) UpdateChanStatus(ctx context.Context,
 		},
 	)
 	return err
+}
+
+type SendToRouteRequest struct {
+	PaymentHash lntypes.Hash
+	Route       QueryRoutesResponse
+	Endorsed    routerrpc.HTLCEndorsement
+}
+
+// SendToRouteV2 sends a payment to the route provided, dispatching the
+// payment asynchronously and returning channels where updates will be
+// provided.
+func (r *routerClient) SendToRouteV2(ctx context.Context,
+	req SendToRouteRequest) (<-chan PaymentStatus,
+	<-chan error) {
+
+	rpcCtx := r.routerKitMac.WithMacaroonAuth(ctx)
+
+	pmtChan := make(chan PaymentStatus, 1)
+	errChan := make(chan error, 1)
+
+	rpcReq := &routerrpc.SendToRouteRequest{
+		PaymentHash: req.PaymentHash[:],
+		Route: &lnrpc.Route{
+			TotalTimeLock: req.Route.TotalTimeLock,
+			TotalAmtMsat:  int64(req.Route.TotalAmtMsat),
+			TotalFeesMsat: int64(req.Route.TotalFeesMsat),
+		},
+		Endorsed: req.Endorsed,
+	}
+
+	for _, hop := range req.Route.Hops {
+		rpcHop := &lnrpc.Hop{
+			ChanId:           hop.ChannelID,
+			Expiry:           hop.Expiry,
+			AmtToForwardMsat: int64(hop.AmtToForwardMsat),
+			FeeMsat:          int64(hop.FeeMsat),
+		}
+		if hop.PubKey != nil {
+			rpcHop.PubKey = hop.PubKey.String()
+		}
+
+		rpcReq.Route.Hops = append(rpcReq.Route.Hops, rpcHop)
+	}
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		htlc, err := r.client.SendToRouteV2(rpcCtx, rpcReq)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		switch htlc.Status {
+		case lnrpc.HTLCAttempt_IN_FLIGHT:
+			errChan <- errors.New("SendToRoute in flight state " +
+				"unexpected")
+
+		case lnrpc.HTLCAttempt_FAILED:
+			pmtChan <- PaymentStatus{
+				State: lnrpc.Payment_FAILED,
+			}
+
+		case lnrpc.HTLCAttempt_SUCCEEDED:
+			pmtChan <- PaymentStatus{
+				State: lnrpc.Payment_SUCCEEDED,
+			}
+		}
+	}()
+
+	return pmtChan, errChan
 }
