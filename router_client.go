@@ -1083,6 +1083,8 @@ func (r *routerClient) SendToRouteV2(ctx context.Context,
 			Expiry:           hop.Expiry,
 			AmtToForwardMsat: int64(hop.AmtToForwardMsat),
 			FeeMsat:          int64(hop.FeeMsat),
+			MppRecord:        hop.MppRecord,
+			Metadata:         hop.Metadata,
 		}
 		if hop.PubKey != nil {
 			rpcHop.PubKey = hop.PubKey.String()

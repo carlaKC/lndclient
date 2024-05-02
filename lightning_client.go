@@ -1231,6 +1231,13 @@ type Hop struct {
 	// given, the payment can be executed without relying on a copy of the
 	// channel graph.
 	PubKey *route.Vertex
+
+	// MppRecord is an optional TLV record used for multi-part payments.
+	MppRecord *lnrpc.MPPRecord
+
+	// Metadata is an optional TLV record containing metadata for the
+	// receiving node.
+	Metadata []byte
 }
 
 // QueryRoutesResponse is the response of a QueryRoutes call.
@@ -3926,6 +3933,8 @@ func unmarshallHop(rpcHop *lnrpc.Hop) (*Hop, error) {
 		AmtToForwardMsat: lnwire.MilliSatoshi(rpcHop.AmtToForwardMsat),
 		FeeMsat:          lnwire.MilliSatoshi(rpcHop.FeeMsat),
 		PubKey:           pubKey,
+		MppRecord:        rpcHop.MppRecord,
+		Metadata:         rpcHop.Metadata,
 	}, nil
 }
 
