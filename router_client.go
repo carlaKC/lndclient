@@ -1102,21 +1102,45 @@ func (r *routerClient) SendToRouteV2(ctx context.Context,
 			return
 		}
 
+		htlcAttempt, err := NewHtlcAttempt(htlc)
+		if err != nil {
+			errChan <- fmt.Errorf("invalid htlc: %v", err)
+		}
+
+		status := PaymentStatus{
+			Fee:   req.Route.TotalFeesMsat,
+			Value: req.Route.TotalAmtMsat,
+			Htlcs: []*HtlcAttempt{
+				htlcAttempt,
+			},
+		}
+
 		switch htlc.Status {
 		case lnrpc.HTLCAttempt_IN_FLIGHT:
 			errChan <- errors.New("SendToRoute in flight state " +
 				"unexpected")
 
+			return
+
 		case lnrpc.HTLCAttempt_FAILED:
-			pmtChan <- PaymentStatus{
-				State: lnrpc.Payment_FAILED,
-			}
+			status.State = lnrpc.Payment_FAILED
+			status.FailureReason = lnrpc.PaymentFailureReason_FAILURE_REASON_ERROR
 
 		case lnrpc.HTLCAttempt_SUCCEEDED:
-			pmtChan <- PaymentStatus{
-				State: lnrpc.Payment_SUCCEEDED,
+			status.State = lnrpc.Payment_SUCCEEDED
+			preimage, err := lntypes.MakePreimage(
+				htlc.Preimage,
+			)
+			if err != nil {
+				errChan <- err
+				return
 			}
+
+			status.Preimage = preimage
+
 		}
+
+		pmtChan <- status
 	}()
 
 	return pmtChan, errChan
