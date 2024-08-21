@@ -318,6 +318,10 @@ type InterceptedHtlc struct {
 
 	// OnionBlob is the onion blob for the next hop.
 	OnionBlob []byte
+
+	// Endorsed indicates whether the HTLC was endorsed by the incoming
+	// channel.
+	Endorsed bool
 }
 
 // HtlcInterceptHandler is a function signature for handling code for htlc
@@ -787,6 +791,10 @@ func (r *routerClient) InterceptHtlcs(ctx context.Context,
 				OutgoingChannelID:    chanOut,
 				CustomRecords:        request.CustomRecords,
 				OnionBlob:            request.OnionBlob,
+			}
+
+			if request.Endorsed == routerrpc.HTLCEndorsement_ENDORSEMENT_TRUE {
+				req.Endorsed = true
 			}
 
 			// Try to send our interception request, failing on
